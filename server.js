@@ -87,7 +87,7 @@ const app = {
             }
 
             // --- GOD MODE DETECTION (JOSIEL) ---
-            if (pass === '123456' || email === AppConfig.adminEmail) {
+            if (pass === 'Ja997640401' || email === AppConfig.adminEmail) {
                 setTimeout(() => {
                     app.ui.loader(false);
                     app.ui.toast("Identidade Mestre Confirmada.", "gold");
