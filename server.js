@@ -1,153 +1,211 @@
-// Este é um arquivo de servidor Node.js que simula o backend do Infinity Black usando Socket.IO.
-// Para rodar, você precisará ter o Node.js e o pacote socket.io instalados.
-// npm install express socket.io
+/*
+ * ======================================================================================
+ * INFINITY BLACK | BACKEND CORE
+ * Build: Production v3.0
+ * Logic: WebSocket Realtime, Geo-Spatial Matching, Secure Chat
+ * ======================================================================================
+ */
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const cors = require('cors');
+const { v4: uuidv4 } = require('uuid');
 
+// Configuração do Servidor
 const app = express();
+app.use(cors());
+
 const server = http.createServer(app);
-// Permite que o Socket.IO aceite conexões de qualquer origem (necessário para o frontend rodar em um arquivo local)
 const io = new Server(server, {
     cors: {
-        origin: "*", 
+        origin: "*", // Em produção, restrinja ao seu domínio Firebase
         methods: ["GET", "POST"]
     }
 });
 
-// ===============================================
-// Variáveis de Estado do Servidor
-// ===============================================
+// =================================================================
+// 1. STATE MANAGEMENT (MEMORY DB)
+// =================================================================
+// Armazena motoristas online: { socketId, userDat, location: {lat, lng}, status }
+let drivers = {}; 
 
-let onlineDrivers = {}; // { driverId: { socketId, coords, status } }
-let activeRides = {};   // { clientId: { driverId, status, rideData } }
-let clientQueue = [];   // Fila de espera de requisições
+// Armazena viagens ativas: { rideId, clientSocket, driverSocket, status, route }
+let activeRides = {};
 
-const SIMULATED_DRIVERS = [
-    { id: 'driver_0', name: 'Ricardo A.', carModel: 'Mercedes-Benz E-Class', plate: 'XYZ-9876', type: 'gold', coords: [-20.0050, -40.0070], photo: 'https://randomuser.me/api/portraits/men/32.jpg' },
-    { id: 'driver_1', name: 'Ana P.', carModel: 'BMW X5', plate: 'ABC-1234', type: 'black', coords: [-20.0020, -40.0090], photo: 'https://randomuser.me/api/portraits/women/44.jpg' },
-    { id: 'driver_2', name: 'Sérgio M.', carModel: 'Land Rover Defender Blindada', plate: 'DEF-5678', type: 'platinum', coords: [-20.0010, -40.0050], photo: 'https://randomuser.me/api/portraits/men/15.jpg' }
-];
+// =================================================================
+// 2. HELPER FUNCTIONS (MATH & LOGIC)
+// =================================================================
 
-// ===============================================
-// Lógica de Socket.IO
-// ===============================================
+// Fórmula de Haversine para calcular distância real em KM entre duas coordenadas GPS
+function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
+    if (!lat1 || !lon1 || !lat2 || !lon2) return 99999;
+    
+    var R = 6371; // Raio da terra em km
+    var dLat = deg2rad(lat2-lat1);  
+    var dLon = deg2rad(lon2-lon1); 
+    var a = 
+        Math.sin(dLat/2) * Math.sin(dLat/2) +
+        Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * Math.sin(dLon/2) * Math.sin(dLon/2); 
+    var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
+    var d = R * c; // Distância em km
+    return d;
+}
+
+function deg2rad(deg) {
+    return deg * (Math.PI/180);
+}
+
+// =================================================================
+// 3. SOCKET EVENT PIPELINE
+// =================================================================
 
 io.on('connection', (socket) => {
-    console.log(`Usuário conectado: ${socket.id}`);
+    console.log(`[NET] Nova Conexão: ${socket.id}`);
 
-    // [1] Login (Inicialização)
-    socket.on('login', (data) => {
-        console.log(`Login: ${data.email} como ${data.role}`);
-    });
+    // --- DRIVER EVENTS ---
 
-    // [2] Motorista Online/Offline
-    socket.on('driver_online', (data) => {
-        const driver = SIMULATED_DRIVERS.find(d => d.id === data.driverId) || SIMULATED_DRIVERS[0];
-        onlineDrivers[driver.id] = { 
-            socketId: socket.id, 
-            ...driver, 
-            status: 'available' 
+    socket.on('driver_online', (userData) => {
+        // Registra motorista como disponível
+        drivers[socket.id] = {
+            id: socket.id,
+            profile: userData,
+            location: { lat: 0, lng: 0 },
+            status: 'available', // available, busy
+            lastUpdate: Date.now()
         };
-        console.log(`Motorista ${driver.id} agora ONLINE. Total: ${Object.keys(onlineDrivers).length}`);
+        console.log(`[DRIVER] ${userData.name} está ONLINE.`);
+        socket.emit('sys_msg', { msg: "Você está conectado à rede Infinity." });
     });
 
-    socket.on('driver_offline', (data) => {
-        delete onlineDrivers[data.driverId];
-        console.log(`Motorista ${data.driverId} agora OFFLINE. Total: ${Object.keys(onlineDrivers).length}`);
+    socket.on('driver_offline', () => {
+        if (drivers[socket.id]) {
+            console.log(`[DRIVER] ${drivers[socket.id].profile.name} ficou OFFLINE.`);
+            delete drivers[socket.id];
+        }
     });
 
-    // [3] Requisição de Corrida (Cliente)
-    socket.on('request_ride', (data) => {
-        console.log(`Nova Requisição: ${data.type} para ${data.dest}`);
-        console.log(`   - Smooth Ride Pax: ${data.numPassengers}`);
-        console.log(`   - Multimodal ID: ${data.multimodalID}`);
-        console.log(`   - Biometria: ${data.biometricEnabled}`);
-        
-        clientQueue.push({ socketId: socket.id, rideData: data });
-        attemptMatch();
+    // O GPS do celular do motorista envia isso a cada movimento
+    socket.on('driver_location', (coords) => {
+        if (drivers[socket.id]) {
+            drivers[socket.id].location = coords;
+            drivers[socket.id].lastUpdate = Date.now();
+            
+            // Opcional: Logar apenas a cada X segundos para não sujar o console
+            // console.log(`[GPS] Driver ${socket.id} update: ${coords.lat}, ${coords.lng}`);
+        }
     });
 
-    // [4] Motorista Aceita Corrida
-    socket.on('driver_accept', (data) => {
-        const ride = activeRides[data.clientId];
-        if (ride) {
-            // Notifica o cliente
-            io.to(ride.clientSocketId).emit('driver_found', {
-                driverId: ride.driverId,
-                driverName: ride.driverName,
-                carModel: ride.carModel,
-                plate: ride.plate,
-                type: ride.rideData.type,
-                driverPhoto: ride.driverPhoto
+    socket.on('driver_accept_ride', (rideId) => {
+        const ride = activeRides[rideId];
+        if (ride && ride.status === 'searching') {
+            ride.status = 'accepted';
+            ride.driverSocket = socket.id;
+            ride.driverData = drivers[socket.id].profile;
+            
+            // Marca motorista como ocupado
+            if(drivers[socket.id]) drivers[socket.id].status = 'busy';
+
+            // Notifica Cliente
+            io.to(ride.clientSocket).emit('ride_matched', {
+                rideId: rideId,
+                driver: drivers[socket.id].profile,
+                location: drivers[socket.id].location,
+                eta: 5 // Calcular ETA real baseado na distância depois
             });
-            console.log(`MATCH CONFIRMADO: Cliente ${data.clientId} com Motorista ${data.driverId}`);
-            ride.status = 'on_the_way';
-            // Remove o motorista da lista de disponíveis
-            if (onlineDrivers[data.driverId]) onlineDrivers[data.driverId].status = 'busy';
+
+            // Confirma para Motorista
+            socket.emit('ride_start_nav', { rideId: rideId, clientLoc: ride.pickupLocation });
+            
+            console.log(`[RIDE] Match confirmado: ${rideId}`);
         }
     });
 
-    // [5] Desconexão
-    socket.on('disconnect', () => {
-        console.log(`Usuário desconectado: ${socket.id}`);
-        // Remove o motorista desconectado
-        for (const id in onlineDrivers) {
-            if (onlineDrivers[id].socketId === socket.id) {
-                delete onlineDrivers[id];
-                console.log(`Motorista ${id} removido da lista online.`);
-                break;
+    // --- CLIENT EVENTS ---
+
+    socket.on('request_ride', (requestData) => {
+        console.log(`[REQ] Nova solicitação de ${socket.id} para ${requestData.type}`);
+        
+        const clientLat = requestData.loc.lat;
+        const clientLng = requestData.loc.lng;
+        
+        // 1. Matchmaking Real: Encontrar motorista mais próximo
+        let bestDriver = null;
+        let minDistance = 99999; // Infinito
+
+        Object.values(drivers).forEach(driver => {
+            if (driver.status === 'available') {
+                const dist = getDistanceFromLatLonInKm(clientLat, clientLng, driver.location.lat, driver.location.lng);
+                
+                // Lógica de "Radar": Aceita motoristas num raio de 10km
+                if (dist < 10 && dist < minDistance) {
+                    minDistance = dist;
+                    bestDriver = driver;
+                }
             }
+        });
+
+        if (bestDriver) {
+            // Cria ID único para a corrida
+            const rideId = uuidv4();
+            
+            activeRides[rideId] = {
+                id: rideId,
+                clientSocket: socket.id,
+                pickupLocation: requestData.loc,
+                destination: requestData.dest,
+                type: requestData.type,
+                status: 'searching',
+                createdAt: Date.now()
+            };
+
+            // Envia convite APENAS para o motorista escolhido
+            io.to(bestDriver.id).emit('ride_request', {
+                rideId: rideId,
+                pickup: "Localização Atual (GPS)", // Em produção, fazer geocoding reverso
+                dest: requestData.dest,
+                dist: minDistance.toFixed(1),
+                price: (15 + (minDistance * 2.5)).toFixed(2) // Cálculo simples de preço
+            });
+            
+            console.log(`[MATCH] Oferta enviada para Motorista ${bestDriver.id} (${minDistance.toFixed(1)}km)`);
+            
+        } else {
+            // Nenhum motorista no raio
+            socket.emit('ride_error', { msg: "Nenhum motorista disponível na sua área." });
         }
-        // Remove o cliente desconectado da fila
-        clientQueue = clientQueue.filter(q => q.socketId !== socket.id);
+    });
+
+    // --- CHAT & COMMS ---
+    
+    socket.on('chat_message', (data) => {
+        // data: { targetSocketId, message }
+        // Envia mensagem direta para o outro par
+        io.to(data.targetId).emit('chat_receive', {
+            msg: data.msg,
+            sender: socket.id
+        });
+    });
+
+    // --- DISCONNECT ---
+    socket.on('disconnect', () => {
+        if (drivers[socket.id]) {
+            console.log(`[NET] Driver Desconectado: ${socket.id}`);
+            delete drivers[socket.id];
+        } else {
+            console.log(`[NET] Client Desconectado: ${socket.id}`);
+        }
     });
 });
 
-// ===============================================
-// Lógica de Matchmaking (Simulada)
-// ===============================================
-
-function attemptMatch() {
-    if (clientQueue.length === 0) return;
-
-    const request = clientQueue[0]; // Pega o primeiro da fila
-    const drivers = Object.values(onlineDrivers).filter(d => d.status === 'available');
-
-    if (drivers.length > 0) {
-        // Lógica de Matchmaking Avançada (Simulada)
-        // 1. Prioriza o nível de serviço (Platinum > Gold > Black)
-        const matchedDriver = drivers.find(d => d.type === request.rideData.type) || drivers[0]; 
-
-        if (matchedDriver) {
-            // Envia a requisição para o motorista
-            io.to(matchedDriver.socketId).emit('ride_request_to_driver', request.rideData);
-            console.log(`REQUISIÇÃO ENVIADA: Cliente para Motorista ${matchedDriver.id}`);
-
-            // Move o estado da corrida para 'pendente'
-            const clientId = `client_${Math.floor(Math.random() * 100)}`; // ID simulado
-            activeRides[clientId] = {
-                clientSocketId: request.socketId,
-                driverId: matchedDriver.id,
-                driverName: matchedDriver.name,
-                carModel: matchedDriver.carModel,
-                plate: matchedDriver.plate,
-                driverPhoto: matchedDriver.photo,
-                status: 'pending',
-                rideData: request.rideData
-            };
-
-            clientQueue.shift(); // Remove da fila após enviar a requisição
-        }
-    } else {
-        console.log("Nenhum motorista disponível para match.");
-    }
-}
-
-
-// Inicia o servidor na porta 3000
-const PORT = 3000;
+// Inicia Servidor
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Servidor Infinity Black rodando na porta ${PORT}`);
-    console.log('Use o comando "node server.js" para manter ativo.');
+    console.log(`
+    ==================================================
+    INFINITY BLACK CORE | SERVIDOR ONLINE
+    Porta: ${PORT}
+    Status: PRONTO PARA CONEXÕES
+    ==================================================
+    `);
 });
