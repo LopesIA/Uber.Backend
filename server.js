@@ -1,8 +1,8 @@
 /*
  * ======================================================================================
- * OBSIDIAN | BACKEND CORE v6.0
+ * OBSIDIAN | BACKEND CORE v6.1 (Stable Release)
  * ======================================================================================
- * Features: Admin God Mode Streams, Realtime Geo-Fencing, SOS Dispatch
+ * Features: Admin God Mode, Realtime Geo-Fencing, SOS Dispatch, Native Math
  * ======================================================================================
  */
 
@@ -21,21 +21,34 @@ const io = new Server(server, {
 });
 
 // =================================================================
-// 1. STATE MEMORY (Armazenamento em RAM para velocidade)
+// 1. STATE MEMORY
 // =================================================================
-let users = {};       // Todos os sockets conectados
-let drivers = {};     // Apenas motoristas (Online/Offline)
-let activeRides = {}; // Corridas em andamento
+let users = {};       
+let drivers = {};     
+let activeRides = {}; 
 
 // =================================================================
-// 2. SOCKET ENGINE
+// 2. HELPER FUNCTIONS (Math Nativo - Sem Dependências)
+// =================================================================
+function getDistance(lat1, lon1, lat2, lon2) {
+    const R = 6371; // Raio da Terra em km
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = 
+        Math.sin(dLat/2) * Math.sin(dLat/2) +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2) * Math.sin(dLon/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c; // Distância em KM
+}
+
+// =================================================================
+// 3. SOCKET ENGINE
 // =================================================================
 io.on('connection', (socket) => {
     console.log(`[NET] New Connection: ${socket.id}`);
 
-    // --- HANDSHAKE DE AUTENTICAÇÃO ---
+    // --- HANDSHAKE ---
     socket.on('auth_handshake', (data) => {
-        // data: { role: 'client'|'driver'|'admin', userId: '...', name: '...' }
         users[socket.id] = { ...data, socketId: socket.id, lat: 0, lng: 0 };
         
         if (data.role === 'driver') {
@@ -44,27 +57,22 @@ io.on('connection', (socket) => {
         }
         
         if (data.role === 'admin') {
-            socket.join('admin_room'); // Sala VIP do Admin
+            socket.join('admin_room');
             console.log(`[GOD MODE] Admin ${data.name} ativo.`);
-            // Envia snapshot imediato da frota para o mapa do admin
             socket.emit('admin_fleet_sync', Object.values(drivers));
         }
     });
 
-    // --- TELEMETRIA EM TEMPO REAL (GPS) ---
+    // --- TELEMETRIA ---
     socket.on('telemetry_update', (coords) => {
-        // coords: { lat, lng, speed }
         if (users[socket.id]) {
             users[socket.id].location = coords;
             
-            // Se for motorista, atualiza status da frota
             if (drivers[socket.id]) {
                 drivers[socket.id].location = coords;
                 drivers[socket.id].lastUpdate = Date.now();
             }
 
-            // O GRANDE TRUQUE DO GOD MODE:
-            // Reenvia a posição de TODO MUNDO apenas para a sala 'admin_room'
             io.to('admin_room').emit('god_map_update', {
                 id: socket.id,
                 role: users[socket.id].role,
@@ -75,12 +83,10 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- STATUS DO MOTORISTA ---
+    // --- STATUS MOTORISTA ---
     socket.on('driver_toggle_status', (isOnline) => {
         if (drivers[socket.id]) {
             drivers[socket.id].status = isOnline ? 'online' : 'offline';
-            
-            // Notifica admins no log
             io.to('admin_room').emit('admin_log', {
                 time: new Date().toLocaleTimeString(),
                 msg: `Motorista ${drivers[socket.id].name} agora está ${drivers[socket.id].status}`,
@@ -89,15 +95,15 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- FLUXO DE CORRIDA (MATCHMAKING) ---
+    // --- REQUEST RIDE ---
     socket.on('request_ride', (reqData) => {
-        console.log(`[RIDE] Request from ${socket.id} (${reqData.tier})`);
+        console.log(`[RIDE] Request from ${socket.id}`);
         
-        // 1. Busca motoristas online (Simulação de raio de busca)
+        // Busca motoristas online (Raio infinito para teste, ou usar getDistance < 10)
         const candidates = Object.values(drivers).filter(d => d.status === 'online');
 
         if (candidates.length > 0) {
-            // Pega o primeiro disponível (Lógica simplificada)
+            // Pega o mais próximo (Lógica simplificada: pega o primeiro)
             const driver = candidates[0];
             const rideId = uuidv4();
             
@@ -110,7 +116,6 @@ io.on('connection', (socket) => {
                 price: reqData.price
             };
 
-            // Envia oferta para o motorista
             io.to(driver.socketId).emit('ride_offer', {
                 rideId: rideId,
                 tier: reqData.tier,
@@ -130,40 +135,35 @@ io.on('connection', (socket) => {
             ride.status = 'active';
             if(drivers[socket.id]) drivers[socket.id].status = 'busy';
 
-            // Avisa o cliente que achou motorista
             io.to(ride.client).emit('ride_matched', {
                 driverName: drivers[socket.id].name,
-                carModel: "BMW 320i", // Em produção, pegar do perfil do motorista
+                carModel: "BMW 320i",
                 plate: "OBS-2024",
                 eta: 4
             });
 
-            // Avisa o Admin
             io.to('admin_room').emit('admin_log', {
-                msg: `Corrida iniciada: Motorista ${drivers[socket.id].name} -> Cliente.`,
+                msg: `Corrida iniciada: Motorista ${drivers[socket.id].name}`,
                 type: 'info'
             });
         }
     });
 
-    // --- SEGURANÇA & SOS ---
+    // --- SOS ---
     socket.on('sos_alert', (data) => {
         console.log(`[EMERGENCY] SOS from ${socket.id}`);
-        // Alerta TODOS os admins imediatamente com prioridade máxima
         io.to('admin_room').emit('admin_log', {
             msg: `ALERTA DE PÂNICO: Usuário ${data.user ? data.user.name : 'Desconhecido'}`,
-            type: 'error' // Vermelho no log
+            type: 'error'
         });
     });
 
-    // --- DESCONEXÃO ---
     socket.on('disconnect', () => {
         if (drivers[socket.id]) delete drivers[socket.id];
         delete users[socket.id];
     });
 });
 
-// Inicialização
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`>>> OBSIDIAN CORE SERVER ONLINE on Port ${PORT}`);
