@@ -1,7 +1,22 @@
 {
-  "name": "obsidian-core",
-  "version": "6.2.0",
+  "name": "obsidian-core-server",
+  "version": "9.0.0",
+  "description": "Obsidian Backend Production Server",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "cors": "^2.8.5", "express": "^4.18.2", "socket.io": "^4.7.2", "uuid": "^9.0.1" }
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "helmet": "^7.1.0",
+    "compression": "^1.7.4",
+    "socket.io": "^4.7.2",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
 }
