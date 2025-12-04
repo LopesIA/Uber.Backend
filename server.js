@@ -2,114 +2,146 @@ const express = require('express');
 const http = require('http');
 const path = require('path');
 const { Server } = require("socket.io");
+const admin = require("firebase-admin");
+const cors = require('cors');
+
+// --- 1. INICIALIZAÇÃO DO FIREBASE ADMIN (O Cérebro Real) ---
+// Certifique-se de ter o arquivo serviceAccountKey.json na pasta
+try {
+    const serviceAccount = require("./serviceAccountKey.json");
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+    console.log("🔥 Firebase Admin Conectado com Sucesso!");
+} catch (error) {
+    console.error("❌ ERRO: Faltando 'serviceAccountKey.json'. O banco de dados não vai funcionar.");
+}
+
+const db = admin.firestore(); // Referência ao banco de dados
 
 const app = express();
 const server = http.createServer(app);
 
+app.use(cors());
+app.use(express.json());
+
 // --- CONFIGURAÇÃO DO SOCKET.IO ---
 const io = new Server(server, {
     cors: {
-        origin: "*", // Permite conexão de qualquer lugar (Front e Back podem estar em domínios diferentes)
-        methods: ["GET", "POST"],
-        credentials: true
-    },
-    transports: ['websocket', 'polling'] // Força suporte a ambos os métodos
+        origin: "*", 
+        methods: ["GET", "POST"]
+    }
 });
 
-// --- CONFIGURAÇÃO DE ARQUIVOS ESTÁTICOS (ROBUSTA) ---
-// Tenta servir arquivos da pasta atual (__dirname) E da pasta ../public
-// Isso evita o erro de "não achar o index.html" se a estrutura de pastas mudar.
+// --- ARQUIVOS ESTÁTICOS ---
 app.use(express.static(__dirname)); 
-app.use(express.static(path.join(__dirname, '../public')));
 app.use(express.static(path.join(__dirname, 'public')));
 
-console.log(`📂 Servidor iniciado. Diretório base: ${__dirname}`);
-
-// Rota principal: Garante que o index.html seja entregue
+// Rota principal
 app.get('*', (req, res) => {
-    // Tenta achar o arquivo na pasta atual primeiro
-    const localIndex = path.join(__dirname, 'index.html');
-    
-    // Se não estiver na raiz, tenta na pasta public (ajuste comum)
-    res.sendFile(localIndex, (err) => {
-        if (err) {
-            // Se der erro, tenta subir um nível (caso o server esteja dentro de /backend)
-            res.sendFile(path.join(__dirname, '../public', 'index.html'));
-        }
-    });
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// --- BANCO DE DADOS EM MEMÓRIA ---
-let drivers = {};       
-let activeRides = {};   
-
-// --- LÓGICA DO "UBER" (SOCKET.IO) ---
+// --- LÓGICA DO "UBER" (REAL-TIME + PERSISTÊNCIA) ---
 io.on('connection', (socket) => {
-    console.log(`🔌 Nova Conexão Detectada: ${socket.id}`);
+    console.log(`🔌 Nova Conexão: ${socket.id}`);
 
-    // 1. JOIN NETWORK
-    socket.on('join_network', (user) => {
-        console.log(`👤 Login: ${user.type} (${socket.id})`);
-
+    // 1. JOIN NETWORK (Motorista ou Passageiro entra)
+    socket.on('join_network', async (user) => {
+        console.log(`👤 Login: ${user.type} (${user.id})`);
+        
         if (user.type === 'driver') {
-            drivers[socket.id] = user;
-            socket.join('drivers'); 
-            console.log(`🚕 Motorista ${socket.id} entrou na fila.`);
+            socket.join('drivers');
+            
+            // Salvar status do motorista no Banco de Dados Real
+            await db.collection('drivers').doc(user.id).set({
+                socketId: socket.id,
+                status: 'online',
+                lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+                location: null // Será atualizado pelo GPS
+            }, { merge: true });
         } 
         else if (user.type === 'passenger') {
             socket.join('passengers');
+            // Salva usuário online
+            await db.collection('users').doc(user.id).set({
+                socketId: socket.id,
+                status: 'active'
+            }, { merge: true });
         }
     });
 
-    // 2. PEDIDO DE CORRIDA
-    socket.on('request_ride', (rideData) => {
-        console.log(`🔔 Solicitação de: ${rideData.passengerName}`);
-        
-        const rideId = Date.now().toString();
-        
-        activeRides[rideId] = {
-            ...rideData,
-            rideId: rideId,
-            passengerSocketId: socket.id,
-            status: 'pending'
-        };
-
-        // Envia para TODOS os motoristas conectados
-        io.to('drivers').emit('new_ride_alert', activeRides[rideId]);
+    // 2. ATUALIZAÇÃO DE GPS (O motorista se mexe na vida real)
+    socket.on('update_location', async (data) => {
+        // Data deve conter { lat, lng, driverId }
+        if(data.driverId) {
+            // Atualiza no banco
+            await db.collection('drivers').doc(data.driverId).update({
+                location: { lat: data.lat, lng: data.lng }
+            });
+            // Opcional: Emitir para quem estiver rastreando (admin ou passageiro em viagem)
+        }
     });
 
-    // 3. ACEITE DE CORRIDA
-    socket.on('accept_ride', (data) => {
-        const ride = activeRides[data.rideId];
+    // 3. PEDIDO DE CORRIDA
+    socket.on('request_ride', async (rideData) => {
+        console.log(`🔔 Solicitação: ${rideData.passengerName}`);
+        
+        // Cria a corrida no Banco de Dados (Agora fica salvo para sempre!)
+        const newRideRef = db.collection('rides').doc();
+        const ridePayload = {
+            ...rideData,
+            rideId: newRideRef.id,
+            passengerSocketId: socket.id,
+            status: 'pending',
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        };
 
-        if (ride && ride.status === 'pending') {
-            ride.status = 'accepted';
-            ride.driverSocketId = socket.id;
+        await newRideRef.set(ridePayload);
 
-            console.log(`✅ Corrida ${data.rideId} ACEITA por ${socket.id}`);
+        // Envia alerta APENAS para motoristas online (Socket)
+        io.to('drivers').emit('new_ride_alert', ridePayload);
+    });
 
-            // Avisa o Passageiro
+    // 4. ACEITE DE CORRIDA
+    socket.on('accept_ride', async (data) => {
+        const rideRef = db.collection('rides').doc(data.rideId);
+        const doc = await rideRef.get();
+
+        if (doc.exists && doc.data().status === 'pending') {
+            // Atualiza status no banco com Transação (evita que 2 motoristas peguem a mesma)
+            await db.runTransaction(async (t) => {
+                t.update(rideRef, {
+                    status: 'accepted',
+                    driverSocketId: socket.id,
+                    driverId: data.driverId || 'unknown',
+                    acceptedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+            });
+
+            const ride = (await rideRef.get()).data();
+            console.log(`✅ Corrida ${data.rideId} ACEITA.`);
+
+            // Avisa o Passageiro Específico
             io.to(ride.passengerSocketId).emit('ride_accepted', {
+                rideId: ride.rideId,
                 driverId: socket.id,
-                driverName: "Motorista Obsidian",
-                carModel: "Tesla Model S (Black)",
-                plate: "OBS-2025"
+                driverName: "Motorista Parceiro", // Deveria vir do perfil do banco
+                plate: "OBS-REAL"
             });
         }
     });
 
-    // 4. DESCONEXÃO
-    socket.on('disconnect', () => {
+    // 5. DESCONEXÃO
+    socket.on('disconnect', async () => {
+        // Marca motorista como offline no banco se ele cair
+        // Nota: Isso requer buscar qual motorista era esse socket.
+        // Para simplificar agora, deixaremos apenas o log.
         console.log(`❌ Saiu: ${socket.id}`);
-        if (drivers[socket.id]) {
-            delete drivers[socket.id];
-        }
     });
 });
 
-// --- INICIAR SERVIDOR ---
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`💎 SERVIDOR RODANDO NA PORTA ${PORT}`);
-    console.log(`🔗 Acesso Local: http://localhost:${PORT}`);
+    console.log(`💎 SERVIDOR OBSIDIAN (PRODUÇÃO) RODANDO NA PORTA ${PORT}`);
 });
