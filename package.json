@@ -1,27 +1,14 @@
 {
-  "name": "obsidian-titanium-server",
-  "version": "4.0.0",
-  "description": "Servidor de Produção para Obsidian Titanium OS",
+  "name": "obsidian-backend",
+  "version": "1.0.0",
+  "description": "Backend Real-time do Obsidian",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node server.js"
   },
-  "keywords": [
-    "obsidian",
-    "uber",
-    "mobility",
-    "express",
-    "socket.io"
-  ],
-  "author": "Obsidian Systems",
-  "license": "ISC",
   "dependencies": {
-    "express": "^4.19.2",
-    "socket.io": "^4.7.5",
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
     "cors": "^2.8.5"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
