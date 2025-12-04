@@ -6,111 +6,153 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// Rota de saúde para o Render não dormir
+// Rota de saúde para o Render manter o serviço ativo
 app.get('/', (req, res) => {
-    res.send('OBSIDIAN SERVER: ONLINE & SECURE.');
+    res.send('OBSIDIAN SERVER: RUNNING (v2.0 Secure Mode)');
 });
 
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: "*", // Aceita conexão do seu index.html
+        origin: "*", 
         methods: ["GET", "POST"]
     }
 });
 
-// --- ARMAZENAMENTO EM MEMÓRIA (VOLÁTIL) ---
-// Em produção, isso seria um Banco de Dados (MongoDB/Postgres)
-let drivers = {}; // { socketId: { lat, lng, type, busy } }
-let rides = {};   // { rideId: { passengerId, driverId, status } }
+// --- ARMAZENAMENTO VOLÁTIL (RAM) ---
+// Em produção real, isso iria para um Redis ou Banco de Dados
+let drivers = {}; // { socketId: { id, name, lat, lng, type, busy } }
+let users = {};   // { userId: socketId } (Mapeamento para reconexão)
+let rides = {};   // { rideId: { passengerId, driverId, status, room } }
 
 io.on('connection', (socket) => {
-    console.log(`[CONEXÃO] ID: ${socket.id}`);
+    console.log(`[CONEXÃO] Nova sessão: ${socket.id}`);
 
-    // --- MOTORISTA ---
-    
-    // Motorista fica online
-    socket.on('driver_login', (data) => {
-        drivers[socket.id] = {
-            id: socket.id,
-            ...data, // name, car, type
-            busy: false
-        };
-        console.log(`[DRIVER] ${data.name} está online.`);
-        io.emit('update_drivers_map', Object.values(drivers)); // Atualiza mapa de todos
-    });
-
-    // Motorista aceita corrida
-    socket.on('driver_accept', (payload) => {
-        const ride = rides[payload.rideId];
-        if (ride && ride.status === 'PENDING') {
-            ride.status = 'ACCEPTED';
-            ride.driverId = socket.id;
-            drivers[socket.id].busy = true;
-
-            // Avisa o passageiro específico
-            io.to(ride.passengerId).emit('ride_accepted', {
-                driver: drivers[socket.id],
-                rideId: payload.rideId
-            });
-
-            // Avisa o motorista que deu certo
-            socket.emit('ride_confirmed_driver', { passenger: ride.passengerData });
+    // 1. LOGIN & REGISTRO (VINCULAÇÃO DE SESSÃO)
+    socket.on('login', (userData) => {
+        users[userData.id] = socket.id; // Vincula ID do usuário ao Socket atual
+        socket.userData = userData;     // Salva dados na sessão do socket
+        
+        console.log(`[LOGIN] ${userData.name} (${userData.role})`);
+        
+        if (userData.role === 'driver') {
+            drivers[socket.id] = {
+                ...userData,
+                socketId: socket.id,
+                busy: false
+            };
+            // Atualiza mapa para todos os conectados
+            io.emit('update_drivers_map', Object.values(drivers));
         }
     });
 
-    // --- PASSAGEIRO ---
-
-    // Passageiro pede corrida
+    // 2. PEDIDO DE CORRIDA
     socket.on('request_ride', (data) => {
         const rideId = 'ride_' + Date.now();
+        
+        // Cria a sala segura da corrida (apenas para quem tiver o ID)
+        socket.join(rideId); 
+
         rides[rideId] = {
             id: rideId,
             passengerId: socket.id,
             passengerData: data,
             status: 'PENDING',
-            driverId: null
+            driverId: null,
+            room: rideId
         };
 
-        console.log(`[RIDE] Nova solicitação de ${data.name}`);
+        console.log(`[RIDE] Solicitação ${rideId} de ${data.name} para ${data.to}`);
 
-        // Envia alerta para TODOS os motoristas disponíveis
-        // (Aqui poderia ter filtro de raio/distância)
-        const availableDrivers = Object.keys(drivers).filter(id => !drivers[id].busy);
-        availableDrivers.forEach(driverId => {
-            io.to(driverId).emit('new_ride_request', {
+        // Envia apenas para motoristas livres
+        const availableDrivers = Object.values(drivers).filter(d => !d.busy);
+        availableDrivers.forEach(d => {
+            io.to(d.socketId).emit('new_ride_request', {
                 rideId: rideId,
                 from: data.from,
                 to: data.to,
-                price: data.price,
+                price: data.price, // Preço estimado inicial
                 passengerName: data.name
             });
         });
     });
 
-    // Cancelamento
-    socket.on('cancel_ride', () => {
-        // Lógica de cancelamento simplificada
-        // Notificaria o motorista se houvesse
+    // 3. ACEITE DE CORRIDA (MATCHMAKING)
+    socket.on('driver_accept', (payload) => {
+        const ride = rides[payload.rideId];
+        
+        if (ride && ride.status === 'PENDING') {
+            ride.status = 'ACCEPTED';
+            ride.driverId = socket.id;
+            
+            if (drivers[socket.id]) {
+                drivers[socket.id].busy = true;
+            }
+
+            // Coloca o motorista na mesma sala segura do passageiro
+            socket.join(ride.room);
+
+            // Avisa o passageiro (que já está na sala)
+            io.to(ride.room).emit('ride_accepted', {
+                driver: drivers[socket.id],
+                rideId: payload.rideId,
+                room: ride.room
+            });
+
+            // Confirma para o motorista
+            socket.emit('ride_confirmed_driver', { 
+                passenger: ride.passengerData,
+                room: ride.room 
+            });
+
+            console.log(`[MATCH] Corrida iniciada na sala segura: ${ride.room}`);
+        }
     });
 
-    // --- CHAT ---
+    // 4. CHAT PRIVADO (SEGURANÇA DE DADOS)
     socket.on('send_message', (data) => {
-        // Envia para a outra ponta (Room ou ID direto)
-        socket.broadcast.emit('receive_message', data); 
+        // data deve conter { room, text, sender }
+        if (data.room) {
+            // .broadcast.to(room) envia para todos na sala MENOS quem mandou
+            socket.broadcast.to(data.room).emit('receive_message', data);
+            console.log(`[CHAT] Sala ${data.room}: ${data.text.substring(0, 20)}...`);
+        }
     });
 
-    // Desconexão
+    // 5. ATUALIZAÇÃO DE LOCALIZAÇÃO (GPS REAL-TIME)
+    socket.on('driver_location_update', (data) => {
+        if (data.room) {
+            socket.broadcast.to(data.room).emit('update_car_position', {
+                lat: data.lat,
+                lng: data.lng
+            });
+        }
+    });
+    
+    // 6. FINALIZAÇÃO DA CORRIDA
+    socket.on('finish_ride', (data) => {
+        if (data.room) {
+            io.to(data.room).emit('ride_finished', data); // Avisa ambos os lados
+            
+            // Limpeza e liberação do motorista
+            const ride = rides[data.rideId];
+            if(ride && drivers[ride.driverId]) {
+                drivers[ride.driverId].busy = false; 
+            }
+        }
+    });
+
+    // 7. DESCONEXÃO
     socket.on('disconnect', () => {
         if (drivers[socket.id]) {
             delete drivers[socket.id];
             io.emit('update_drivers_map', Object.values(drivers));
         }
-        console.log(`[DESCONECTADO] ${socket.id}`);
+        console.log(`[SAIDA] Socket ${socket.id} desconectou.`);
     });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
+    console.log(`OBSIDIAN SERVER v2.0 rodando na porta ${PORT}`);
 });
